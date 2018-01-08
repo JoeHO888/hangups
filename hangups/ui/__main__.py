@@ -16,6 +16,9 @@ from hangups.ui import notifier
 from hangups.ui.utils import get_conv_name, add_color_to_scheme
 
 
+logger = logging.getLogger(__name__)
+
+
 # hangups used to require a fork of urwid called hangups-urwid which may still
 # be installed and create a conflict with the 'urwid' package name. See #198.
 if urwid.__version__ == '1.2.2-dev':
@@ -62,6 +65,10 @@ DISCREET_NOTIFICATION = notifier.Notification(
 )
 
 
+class HangupsDisconnected(Exception):
+    """Raised when hangups is disconnected."""
+
+
 class ChatUI(object):
     """User interface for hangups."""
 
@@ -81,6 +88,8 @@ class ChatUI(object):
         self._tabbed_window = None  # TabbedWindowWidget
         self._conv_list = None  # hangups.ConversationList
         self._user_list = None  # hangups.UserList
+        self._coroutine_queue = CoroutineQueue()
+        self._exc_info = None
 
         # TODO Add urwid widget for getting auth.
         try:
@@ -92,6 +101,7 @@ class ChatUI(object):
         self._client.on_connect.add_observer(self._on_connect)
 
         loop = asyncio.get_event_loop()
+        loop.set_exception_handler(self._exception_handler)
         try:
             self._urwid_loop = urwid.MainLoop(
                 LoadingWidget(), palette, handle_mouse=False,
@@ -104,18 +114,50 @@ class ChatUI(object):
 
         self._urwid_loop.screen.set_terminal_properties(colors=palette_colors)
         self._urwid_loop.start()
+
+        coros = [self._connect(), self._coroutine_queue.consume()]
+
         # Enable bracketed paste mode after the terminal has been switched to
         # the alternate screen (after MainLoop.start() to work around bug
         # 729533 in VTE.
         with bracketed_paste_mode():
             try:
-                # Returns when the connection is closed.
-                loop.run_until_complete(self._client.connect())
+                # Run all the coros, until they all complete or one raises an
+                # exception. In the normal case, HangupsDisconnected will be
+                # raised.
+                loop.run_until_complete(asyncio.gather(*coros))
+            except HangupsDisconnected:
+                pass
             finally:
-                # Ensure urwid cleans up properly and doesn't wreck the
-                # terminal.
+                # Clean up urwid.
                 self._urwid_loop.stop()
+
+                # Cancel all of the coros, and wait for them to shut down.
+                task = asyncio.gather(*coros, return_exceptions=True)
+                task.cancel()
+                loop.run_until_complete(task)
+
                 loop.close()
+
+        # If an exception was stored, raise it now. This is used for exceptions
+        # originating in urwid callbacks.
+        if self._exc_info:
+            raise self._exc_info[0](
+                self._exc_info[1]
+            ).with_traceback(self._exc_info[2])
+
+    @asyncio.coroutine
+    def _connect(self):
+        yield from self._client.connect()
+        raise HangupsDisconnected()
+
+    def _exception_handler(self, _loop, _context):
+        """Handle exceptions from the asyncio loop."""
+        # Start a graceful shutdown.
+        self._coroutine_queue.put(self._client.disconnect())
+
+        # Store the exception info to be re-raised later.
+        self._exc_info = sys.exc_info()
 
     def _input_filter(self, keys, _):
         """Handle global keybindings."""
@@ -125,7 +167,7 @@ class ChatUI(object):
             else:
                 self._hide_menu()
         elif keys == [self._keys['quit']]:
-            self._on_quit()
+            self._coroutine_queue.put(self._client.disconnect())
         else:
             return keys
 
@@ -150,11 +192,11 @@ class ChatUI(object):
         if conv_id not in self._conv_widgets:
             set_title_cb = (lambda widget, title:
                             self._tabbed_window.set_tab(widget, title=title))
-            widget = ConversationWidget(self._client,
-                                        self._conv_list.get(conv_id),
-                                        set_title_cb,
-                                        self._keys,
-                                        self._datetimefmt)
+            widget = ConversationWidget(
+                self._client, self._coroutine_queue,
+                self._conv_list.get(conv_id), set_title_cb, self._keys,
+                self._datetimefmt
+            )
             self._conv_widgets[conv_id] = widget
         return self._conv_widgets[conv_id]
 
@@ -205,10 +247,38 @@ class ChatUI(object):
                 )
             self._notifier.send(notification)
 
-    def _on_quit(self):
-        """Handle the user quitting the application."""
-        future = asyncio.async(self._client.disconnect())
-        future.add_done_callback(lambda future: future.result())
+
+class CoroutineQueue:
+    """Coroutine queue for the user interface.
+
+    Urwid executes callback functions for user input rather than coroutines.
+    This creates a problem if we need to execute a coroutine in response to
+    user input.
+
+    One option is to use asyncio.async to execute a "fire and forget"
+    coroutine. If we do this, exceptions will be logged instead of propagated,
+    which can obscure problems.
+
+    This class allows callbacks to place coroutines into a queue, and have them
+    executed by another coroutine. Exceptions will be propagated from the
+    consume method.
+    """
+
+    def __init__(self):
+        self._queue = asyncio.Queue()
+
+    def put(self, coro):
+        logger.info('Adding %s to CoroutineQueue', coro)
+        assert asyncio.iscoroutine(coro)
+        self._queue.put_nowait(coro)
+
+    @asyncio.coroutine
+    def consume(self):
+        while True:
+            coro = yield from self._queue.get()
+            logger.info('CoroutineQueue executing %s', coro)
+            assert asyncio.iscoroutine(coro)
+            yield from coro
 
 
 class WidgetBase(urwid.WidgetWrap):
@@ -731,9 +801,10 @@ class ConversationEventListWalker(urwid.ListWalker):
 class ConversationWidget(WidgetBase):
     """Widget for interacting with a conversation."""
 
-    def __init__(self, client, conversation, set_title_cb, keybindings,
-                 datetimefmt):
+    def __init__(self, client, coroutine_queue, conversation, set_title_cb,
+                 keybindings, datetimefmt):
         self._client = client
+        self._coroutine_queue = coroutine_queue
         self._conversation = conversation
         self._conversation.on_event.add_observer(self._on_event)
         self._conversation.on_watermark_notification.add_observer(
@@ -772,12 +843,10 @@ class ConversationWidget(WidgetBase):
     def keypress(self, size, key):
         """Handle marking messages as read and keeping client active."""
         # Set the client as active.
-        future = asyncio.async(self._client.set_active())
-        future.add_done_callback(lambda future: future.result())
+        self._coroutine_queue.put(self._client.set_active())
 
         # Mark the newest event as read.
-        future = asyncio.async(self._conversation.update_read_timestamp())
-        future.add_done_callback(lambda future: future.result())
+        self._coroutine_queue.put(self._conversation.update_read_timestamp())
 
         return super().keypress(size, key)
 
@@ -800,17 +869,20 @@ class ConversationWidget(WidgetBase):
         else:
             image_file = None
         text = replace_emoticons(text)
-        # XXX: Exception handling here is still a bit broken. Uncaught
-        # exceptions in _on_message_sent will only be logged.
         segments = hangups.ChatMessageSegment.from_str(text)
-        asyncio.async(
-            self._conversation.send_message(segments, image_file=image_file)
-        ).add_done_callback(self._on_message_sent)
+        self._coroutine_queue.put(
+            self._handle_send_message(
+                self._conversation.send_message(
+                    segments, image_file=image_file
+                )
+            )
+        )
 
-    def _on_message_sent(self, future):
+    @asyncio.coroutine
+    def _handle_send_message(self, coro):
         """Handle showing an error if a message fails to send."""
         try:
-            future.result()
+            yield from coro
         except hangups.NetworkError:
             self._status_widget.show_message('Failed to send message')
 
@@ -1065,11 +1137,6 @@ def main():
         )
     except KeyboardInterrupt:
         sys.exit('Caught KeyboardInterrupt, exiting abnormally')
-    except:
-        # urwid will prevent some exceptions from being printed unless we use
-        # print a newline first.
-        print('')
-        raise
 
 
 if __name__ == '__main__':

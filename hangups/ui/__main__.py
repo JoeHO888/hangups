@@ -310,7 +310,9 @@ class LoadingWidget(WidgetBase):
 class RenameConversationDialog(WidgetBase):
     """Dialog widget for renaming a conversation."""
 
-    def __init__(self, conversation, on_cancel, on_save, keybindings):
+    def __init__(self, coroutine_queue, conversation, on_cancel, on_save,
+                 keybindings):
+        self._coroutine_queue = coroutine_queue
         self._conversation = conversation
         edit = urwid.Edit(edit_text=get_conv_name(conversation))
         items = [
@@ -328,20 +330,19 @@ class RenameConversationDialog(WidgetBase):
 
     def _rename(self, name, callback):
         """Rename conversation and call callback."""
-        future = asyncio.async(self._conversation.rename(name))
-        future.add_done_callback(lambda future: future.result())
+        self._coroutine_queue.put(self._conversation.rename(name))
         callback()
 
 
 class ConversationMenu(WidgetBase):
     """Menu for conversation actions."""
 
-    def __init__(self, conversation, close_callback, keybindings):
+    def __init__(self, coroutine_queue, conversation, close_callback,
+                 keybindings):
         rename_dialog = RenameConversationDialog(
-            conversation,
+            coroutine_queue, conversation,
             lambda: frame.contents.__setitem__('body', (list_box, None)),
-            close_callback,
-            keybindings
+            close_callback, keybindings
         )
         items = [
             urwid.Text(
@@ -677,7 +678,8 @@ class ConversationEventListWalker(urwid.ListWalker):
 
     POSITION_LOADING = 'loading'
 
-    def __init__(self, conversation, datetimefmt):
+    def __init__(self, coroutine_queue, conversation, datetimefmt):
+        self._coroutine_queue = coroutine_queue  # CoroutineQueue
         self._conversation = conversation  # Conversation
         self._is_scrolling = False  # Whether the user is trying to scroll up
         self._is_loading = False  # Whether we're currently loading more events
@@ -735,8 +737,7 @@ class ConversationEventListWalker(urwid.ListWalker):
                 # TODO: Show the full date the conversation was created.
                 return urwid.Text('No more messages', align='center')
             else:
-                future = asyncio.async(self._load())
-                future.add_done_callback(lambda future: future.result())
+                self._coroutine_queue.put(self._load())
                 return urwid.Text('Loading...', align='center')
         try:
             # When creating the widget, also pass the previous event so a
@@ -816,8 +817,9 @@ class ConversationWidget(WidgetBase):
         self._set_title_cb = set_title_cb
         self._set_title()
 
-        self._list_walker = ConversationEventListWalker(conversation,
-                                                        datetimefmt)
+        self._list_walker = ConversationEventListWalker(
+            coroutine_queue, conversation, datetimefmt
+        )
         self._list_box = ListBox(keybindings, self._list_walker)
         self._status_widget = StatusLineWidget(client, conversation)
         self._widget = urwid.Pile([
@@ -838,7 +840,10 @@ class ConversationWidget(WidgetBase):
 
     def get_menu_widget(self, close_callback):
         """Return the menu widget associated with this widget."""
-        return ConversationMenu(self._conversation, close_callback, self._keys)
+        return ConversationMenu(
+            self._coroutine_queue, self._conversation, close_callback,
+            self._keys
+        )
 
     def keypress(self, size, key):
         """Handle marking messages as read and keeping client active."""

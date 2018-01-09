@@ -708,27 +708,24 @@ class ConversationEventListWalker(urwid.ListWalker):
     @asyncio.coroutine
     def _load(self):
         """Load more events for this conversation."""
-        # Don't try to load while we're already loading.
-        if not self._is_loading and not self._first_loaded:
-            self._is_loading = True
-            try:
-                conv_events = yield from self._conversation.get_events(
-                    self._conversation.events[0].id_
-                )
-            except (IndexError, hangups.NetworkError):
-                conv_events = []
-            if not conv_events:
-                self._first_loaded = True
-            if self._focus_position == self.POSITION_LOADING and conv_events:
-                # If the loading indicator is still focused, and we loaded more
-                # events, set focus on the first new event so the loaded
-                # indicator is replaced.
-                self.set_focus(conv_events[-1].id_)
-            else:
-                # Otherwise, still need to invalidate in case the loading
-                # indicator is showing but not focused.
-                self._modified()
-            self._is_loading = False
+        try:
+            conv_events = yield from self._conversation.get_events(
+                self._conversation.events[0].id_
+            )
+        except (IndexError, hangups.NetworkError):
+            conv_events = []
+        if not conv_events:
+            self._first_loaded = True
+        if self._focus_position == self.POSITION_LOADING and conv_events:
+            # If the loading indicator is still focused, and we loaded more
+            # events, set focus on the first new event so the loaded
+            # indicator is replaced.
+            self.set_focus(conv_events[-1].id_)
+        else:
+            # Otherwise, still need to invalidate in case the loading
+            # indicator is showing but not focused.
+            self._modified()
+        self._is_loading = False
 
     def __getitem__(self, position):
         """Return widget at position or raise IndexError."""
@@ -737,7 +734,10 @@ class ConversationEventListWalker(urwid.ListWalker):
                 # TODO: Show the full date the conversation was created.
                 return urwid.Text('No more messages', align='center')
             else:
-                self._coroutine_queue.put(self._load())
+                # Don't try to load while we're already loading.
+                if not self._is_loading and not self._first_loaded:
+                    self._is_loading = True
+                    self._coroutine_queue.put(self._load())
                 return urwid.Text('Loading...', align='center')
         try:
             # When creating the widget, also pass the previous event so a
